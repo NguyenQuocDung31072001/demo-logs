@@ -1,4 +1,4 @@
-import { Controller } from '@nestjs/common';
+import { Body, Controller, HttpException, HttpStatus, Param, Patch } from '@nestjs/common';
 import {
   Crud,
   CrudController,
@@ -11,8 +11,10 @@ import {
 import { ApiTags } from '@nestjs/swagger';
 import { User } from '../entities/user.entity';
 import { Role } from '../entities/role.entity';
-import { RolesService } from '../services';
+import { ActionsService, RolesService } from '../services';
 import { LogsService } from 'src/modules/logs/logs.service';
+import { getAddAndDeleteIds } from 'src/shared/helper/get-add-and-delete-ids';
+import { log } from 'console';
 
 @ApiTags('users')
 @Crud({
@@ -38,7 +40,7 @@ import { LogsService } from 'src/modules/logs/logs.service';
 })
 @Controller('roles')
 export class RolesController implements CrudController<Role> {
-  constructor(public service: RolesService, public logs: LogsService) {}
+  constructor(public service: RolesService, public logs: LogsService, public actionServices: ActionsService) {}
 
   @Override('getOneBase')
   async getOne(@ParsedRequest() req: CrudRequest) {
@@ -96,8 +98,45 @@ export class RolesController implements CrudController<Role> {
     return newRoles;
   }
 
+  @Patch('/update-custom/:id')
+  async updateCustom(
+    @Param('id') id: string,
+    @Body()
+    dto: {
+      name: string;
+      role_key: string;
+      actions: {
+        create: string[];
+        delete: string[];
+      };
+    },
+  ) {
+    try {
+      const { create: actionsToAdd, delete: actionsToRemove } = dto.actions;
+
+      await this.service.validateIdsOfActions({ roleId: id, actionsToAdd, actionsToRemove });
+
+      if (actionsToRemove.length > 0) {
+        await this.service.deleteRoleToActionByIds({
+          roleId: id,
+          ids: actionsToRemove,
+        });
+      }
+      if (actionsToAdd.length > 0) {
+        await this.service.createManyRoleToAction({ roleId: id, actionIds: actionsToAdd });
+      }
+      this.logs.record('Role ' + dto.name + ' was updated');
+
+      return await this.service.rawUpdateOne({ id: id, name: dto.name, role_key: dto.role_key });
+    } catch (error) {
+      this.logs.record('Error: ' + error.message);
+      throw new HttpException(new Error(error).message, HttpStatus.BAD_REQUEST);
+    }
+  }
+
   @Override('updateOneBase')
   async updateOne(
+    @Param('id') id: string,
     @ParsedRequest() req: CrudRequest,
     @ParsedBody()
     dto: {
@@ -107,24 +146,25 @@ export class RolesController implements CrudController<Role> {
     },
   ) {
     this.logs.record('Role ' + dto.name + ' was updated');
-    const updatedRoles = await this.service.updateOne(req, dto);
     if (dto.actions?.length > 0) {
-      const currentActions = await this.service.getActionDetailByRoleId(updatedRoles.id);
-      const currentActionsIds = currentActions.map((item) => item.id);
-      const actionsToDelete = currentActionsIds.filter((item) => !dto.actions.includes(item?.toString()));
-      const actionsToAdd = dto.actions.filter((item) => !currentActionsIds.some((i) => i?.toString() === item));
+      const currentActionsIds = await this.service.getIdOfActionsByRoleId(id);
 
-      if (actionsToDelete.length > 0) {
+      const { addIds, deleteIds } = getAddAndDeleteIds({
+        currentIds: currentActionsIds,
+        requestedIds: dto.actions,
+      });
+
+      if (deleteIds.length > 0) {
         await this.service.deleteRoleToActionByIds({
-          roleId: updatedRoles.id,
-          ids: actionsToDelete,
+          roleId: id,
+          ids: deleteIds,
         });
       }
-      if (actionsToAdd.length > 0) {
-        await this.service.createManyRoleToAction({ roleId: updatedRoles.id, actionIds: actionsToAdd });
+      if (addIds.length > 0) {
+        await this.service.createManyRoleToAction({ roleId: id, actionIds: addIds });
       }
     }
-    return updatedRoles;
+    return await this.service.updateOne(req, dto);
   }
 
   @Override('deleteOneBase')
